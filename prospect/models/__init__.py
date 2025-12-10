@@ -6,7 +6,7 @@ specifications.
 """
 
 
-from .parameters import ProspectorParams
+from .parameters import ProspectorParams, LockedDict
 from .sedmodel import SpecModel, HyperSpecModel, AGNSpecModel, AGNPolySpecModel
 
 
@@ -14,6 +14,7 @@ __all__ = ["ProspectorParams",
            "SpecModel",
            "HyperSpecModel",
            "AGNSpecModel",
-           "AGNPolySpecModel"
+           "AGNPolySpecModel",
+           "LockedDict",
            ]
 

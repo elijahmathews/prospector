@@ -11,11 +11,12 @@ from copy import deepcopy
 import inspect
 import warnings
 import numpy as np
+from contextlib import contextmanager
 from . import priors
 from .templates import describe
 
 
-__all__ = ["ProspectorParams"]
+__all__ = ["ProspectorParams", "LockedDict"]
 
 
 # A template for what parameter configuration list element should look like
@@ -25,6 +26,45 @@ param_template = {'name': '',
                   'init': 0.5, 'units': '',
                   'prior': priors.TopHat(mini=0, maxi=1.0),
                   'depends_on': None}
+
+
+class LockedDict(dict):
+    """A dictionary that prevents modification unless explicitly unlocked.
+    Read access (__getitem__) remains native speed (C-level).
+
+    This is used to protect the model configuration dictionary from accidental
+    modification, which could invalidate cached dependency orders.
+    """
+    _locked = True
+
+    def __setitem__(self, key, value):
+        if self._locked:
+            raise RuntimeError(
+                "Model configuration is locked to preserve dependency integrity. "
+                "Use 'with model.modify_config():' to make changes."
+            )
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        if self._locked:
+            raise RuntimeError("Model configuration is locked.")
+        super().__delitem__(key)
+
+    def update(self, *args, **kwargs):
+        if self._locked:
+            raise RuntimeError("Model configuration is locked.")
+        super().update(*args, **kwargs)
+
+    def __deepcopy__(self, memo):
+        """Return a standard dictionary when deepcopying.
+        This ensures that serialized or copied models (e.g. for multiprocessing)
+        revert to standard dictionaries unless explicitly re-locked.
+        """
+        return dict({k: deepcopy(v, memo) for k, v in self.items()})
+
+    def __reduce__(self):
+        """Pickling support: return as a plain dictionary."""
+        return (dict, (dict(self),))
 
 
 class ProspectorParams(object):
@@ -122,6 +162,62 @@ class ProspectorParams(object):
         
         # store these initial values
         self.initial_theta = self.theta.copy()
+
+        # Lock the configuration to prevent accidental modification
+        self._lock_configuration()
+
+    def _lock_configuration(self):
+        """Recursively convert config_dict and its sub-dictionaries to LockedDicts.
+        Limits recursion to 2 levels to protect parameter dictionaries.
+        """
+        def recursive_lock(d, depth=0, max_depth=1):
+            if isinstance(d, dict):
+                # Convert children first
+                if depth < max_depth:
+                    new_d = {k: recursive_lock(v, depth + 1, max_depth) for k, v in d.items()}
+                else:
+                    new_d = d.copy()
+
+                # Convert this dict to LockedDict
+                ld = LockedDict(new_d)
+                ld._locked = True
+                return ld
+            return d
+
+        # Replace the standard dict with the locked version
+        self.config_dict = recursive_lock(self.config_dict, max_depth=1)
+
+    @contextmanager
+    def modify_config(self):
+        """Context manager to safely modify configuration.
+
+        Usage:
+            with model.modify_config():
+                model.config_dict["mass"]["depends_on"] = new_func
+
+        On exit, this automatically:
+        1. Re-syncs config_list
+        2. Re-runs configuration to update theta mapping and dependency order
+        3. Re-locks the configuration
+        """
+        # 1. Recursive Unlock
+        def set_lock_state(d, state):
+            if isinstance(d, LockedDict):
+                d._locked = state
+                for v in d.values():
+                    set_lock_state(v, state)
+
+        try:
+            set_lock_state(self.config_dict, False)
+            yield
+        finally:
+            # 2. Sync config_list with config_dict
+            self.config_list = pdict_to_plist(self.config_dict, order=self.parameter_order)
+
+            # 3. Re-configure logic
+            # This is necessary to update theta_index, ndim, params, and dependencies and re-lock
+            # We call configure with reset=False to preserve existing parameters where possible
+            self.configure(reset=False)
 
     def map_theta(self):
         """Construct the mapping from parameter name to the index in the theta
